@@ -1,76 +1,112 @@
-import { Worker, Queue, FlowProducer } from 'bullmq';
-import { prisma, emailQueue } from './app';
-import { createTransport } from 'nodemailer';
-import { sendSlackAlert } from '../slack/notifier';
-import { acquireRateSlot } from '../utils/rateLimiter';
+import { Worker, Job } from 'bullmq';
+import nodemailer from 'nodemailer';
+import { PrismaClient } from '@prisma/client';
+import IORedis from 'ioredis';
 import dotenv from 'dotenv';
+import axios from 'axios';
 
 dotenv.config();
 
-const connection = emailQueue.client;
+const prisma = new PrismaClient();
 
-// Email transporter (Ethereal)
-const transporter = createTransport({
-  host: 'smtp.ethereal.email',
-  port: 587,
-  auth: {
-    user: process.env.ETHEREAL_USER,
-    pass: process.env.ETHEREAL_PASS,
+const connection = new IORedis(process.env.REDIS_URL || 'redis://localhost:6379');
+
+// Rate‑limit config
+const MAX_EMAILS_PER_HOUR = parseInt(process.env.MAX_EMAILS_PER_HOUR || '200');
+const MIN_DELAY_MS = parseInt(process.env.MIN_DELAY_MS || '2000'); // 2 s default
+
+// Slack webhook lookup helper
+async function getSlackWebhook(userId: string): Promise<string | null> {
+  const record = await prisma.slackIntegration.findFirst({ where: { userId } });
+  return record?.webhookUrl ?? null;
+}
+
+// Simple Redis‑based hourly counter
+async function canSend(sender: string): Promise<boolean> {
+  const now = Date.now();
+  const hourKey = `emailRate:${sender}:${Math.floor(now / 3600000)}`; // hour bucket
+  const count = await connection.incr(hourKey);
+  if (count === 1) {
+    // set expiry to end of the hour
+    await connection.pexpireat(hourKey, (Math.floor(now / 3600000) + 1) * 3600000);
+  }
+  return count <= MAX_EMAILS_PER_HOUR;
+}
+
+async function sendSlackAlert(webhook: string, sender: string) {
+  try {
+    await axios.post(webhook, { text: `⚠️ Sender *${sender}* hit the hourly email limit (${MAX_EMAILS_PER_HOUR}).` });
+  } catch (e) {
+    console.error('Slack notification failed', e);
+  }
+}
+
+// Create Ethereal transporter (or use provided credentials)
+async function createTransport() {
+  if (process.env.ETHEREAL_USER && process.env.ETHEREAL_PASS) {
+    return nodemailer.createTransport({
+      host: 'smtp.ethereal.email',
+      port: 587,
+      auth: { user: process.env.ETHEREAL_USER, pass: process.env.ETHEREAL_PASS },
+    });
+  }
+  // fallback: generate test account
+  const testAccount = await nodemailer.createTestAccount();
+  return nodemailer.createTransport({
+    host: 'smtp.ethereal.email',
+    port: 587,
+    auth: { user: testAccount.user, pass: testAccount.pass },
+  });
+}
+
+const worker = new Worker(
+  'emailQueue',
+  async (job: Job) => {
+    const { sender, subject, body, to } = job.data as any;
+
+    // Idempotency check – ensure not already sent
+    const existing = await prisma.emailJob.findUnique({ where: { id: job.id as string } });
+    if (existing?.status === 'sent') {
+      console.log(`Job ${job.id} already sent, skipping`);
+      return;
+    }
+
+    const allowed = await canSend(sender);
+    if (!allowed) {
+      // Re‑schedule for next hour preserving order
+      const delay = 60 * 60 * 1000; // 1 hour
+      await job.moveToDelayed(Date.now() + delay);
+      // Notify Slack if integration exists
+      const webhook = await getSlackWebhook(sender);
+      if (webhook) await sendSlackAlert(webhook, sender);
+      console.log(`Rate limit exceeded for ${sender}, job delayed 1h`);
+      return;
+    }
+
+    const transporter = await createTransport();
+    const info = await transporter.sendMail({ from: sender, to, subject, html: body });
+    console.log('Message sent: %s', info.messageId);
+    // Update DB status
+    await prisma.emailJob.update({
+      where: { id: job.id as string },
+      data: { status: 'sent', sentAt: new Date() },
+    });
+    // Optional: log preview URL for Ethereal
+    console.log('Preview URL: %s', nodemailer.getTestMessageUrl(info));
   },
+  {
+    connection,
+    concurrency: parseInt(process.env.WORKER_CONCURRENCY || '5'),
+    // Enforce minimum delay between job executions (BullMQ limiter)
+    limiter: {
+      max: 1,
+      duration: MIN_DELAY_MS,
+    },
+  },
+);
+
+worker.on('error', (err) => {
+  console.error('Worker error', err);
 });
 
-// Worker processing function
-type EmailJobData = {
-  jobId: string;
-  to: string;
-  subject: string;
-  html: string;
-  senderId: string; // could be tenant or user identifier
-};
-
-const emailWorker = new Worker<EmailJobData>('emailQueue', async job => {
-  const { jobId, to, subject, html, senderId } = job.data;
-
-  // Idempotency: check DB if already sent
-  const existing = await prisma.emailJob.findUnique({ where: { id: jobId } });
-  if (existing?.status === 'sent') {
-    return; // already done
-  }
-
-  // Rate limit check – returns true if allowed, false if limit reached
-  const allowed = await acquireRateSlot(senderId);
-  if (!allowed) {
-    // Reschedule for next hour start
-    const now = Date.now();
-    const nextHour = new Date();
-    nextHour.setMinutes(0, 0, 0);
-    nextHour.setHours(nextHour.getHours() + 1);
-    const delay = nextHour.getTime() - now;
-    await emailQueue.add('send-email', job.data, { delay, attempts: 3 });
-    // Notify via Slack if configured
-    await sendSlackAlert(senderId, `Hourly email limit reached for sender ${senderId}. Jobs delayed to next hour.`);
-    return;
-  }
-
-  // Send email via Ethereal
-  await transporter.sendMail({
-    from: 'no-reply@reachinbox.com',
-    to,
-    subject,
-    html,
-  });
-
-  // Update DB status
-  await prisma.emailJob.update({
-    where: { id: jobId },
-    data: { status: 'sent', sentAt: new Date() },
-  });
-
-  // (Optional) Index in Elasticsearch – omitted here for brevity
-}, { connection, concurrency: Number(process.env.WORKER_CONCURRENCY) || 5 });
-
-emailWorker.on('failed', (job, err) => {
-  console.error(`Job ${job?.id} failed:`, err);
-});
-
-console.log('✅ Email worker started');
+console.log('Email worker started');

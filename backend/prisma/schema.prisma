@@ -1,34 +1,28 @@
-// prisma/schema.prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
 
 generator client {
   provider = "prisma-client-js"
 }
 
-datasource db {
-  provider = "postgresql"
-  url      = env("POSTGRES_URL")
-}
-
-enum EmailJobStatus {
-  scheduled
-  sent
-  failed
-}
-
 model EmailJob {
-  id           String        @id @default(uuid())
-  to           String
+  id           String   @id @default(uuid())
+  sender       String
   subject      String
-  html         String
-  senderId     String
-  status       EmailJobStatus @default(scheduled)
+  body         String
+  to           String   // comma‑separated list for simplicity
   scheduledAt  DateTime
-  sentAt       DateTime?    
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
+  sentAt       DateTime?
+  status       String   @default("scheduled") // scheduled | sent | failed
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
 
 model SlackIntegration {
-  senderId   String @id
-  webhookUrl String?
+  id          String @id @default(uuid())
+  userId      String
+  webhookUrl  String
+  createdAt   DateTime @default(now())
 }
